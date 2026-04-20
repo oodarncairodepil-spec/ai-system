@@ -246,13 +246,17 @@ app.post('/api/services/:name/restart', async (req, res) => {
   }
 });
 
-app.get('/api/logs', (req, res) => {
+app.get('/api/logs', async (req, res) => {
   const name = String(req.query.service || '');
   if (!name) {
     res.status(400).json({ error: 'missing service' });
     return;
   }
-  res.json(services.getLogs(name, req.query.tail));
+  try {
+    res.json(await services.getLogs(name, req.query.tail));
+  } catch (err) {
+    res.status(500).json({ error: 'logs failed', message: String(err?.message || err) });
+  }
 });
 
 app.get('/api/deploy/status', (req, res) => {

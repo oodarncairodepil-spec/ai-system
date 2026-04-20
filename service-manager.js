@@ -38,6 +38,7 @@ function normalizeService(def) {
     stopCommand: def.stopCommand ? toArray(def.stopCommand) : null,
     restartCommand: def.restartCommand ? toArray(def.restartCommand) : null,
     statusCommand: def.statusCommand ? toArray(def.statusCommand) : null,
+    logCommand: def.logCommand ? toArray(def.logCommand) : null,
     stopSignal: def.stopSignal ? String(def.stopSignal) : 'SIGTERM',
     killTimeoutMs: Number.isFinite(def.killTimeoutMs) ? def.killTimeoutMs : 5000,
     maxLogLines: Number.isFinite(def.maxLogLines) ? def.maxLogLines : 2000,
@@ -145,9 +146,20 @@ class ServiceManager extends EventEmitter {
     this.emit('log', { name, line });
   }
 
-  getLogs(name, tail = 200) {
+  async getLogs(name, tail = 200) {
+    const def = this.services.get(name);
     const buffer = this.logs.get(name) || [];
     const n = Math.max(1, Math.min(5000, Number(tail) || 200));
+    if (def && def.type !== 'command' && def.logCommand) {
+      const templated = def.logCommand.map((p) => String(p).replaceAll('{{tail}}', String(n)));
+      const result = await this.execCommand(templated, { cwd: def.cwd || process.cwd(), env: { ...process.env, ...(def.env || {}) } });
+      const combined = [result.stdout, result.stderr].filter(Boolean).join('\n');
+      const lines = combined.split(/\r?\n/).filter(Boolean);
+      if (!result.ok && result.error) {
+        lines.push(`error: ${result.error}`);
+      }
+      return lines.slice(-n);
+    }
     return buffer.slice(-n);
   }
 
@@ -296,4 +308,3 @@ class ServiceManager extends EventEmitter {
 }
 
 module.exports = { ServiceManager };
-

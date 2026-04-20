@@ -10,7 +10,7 @@
     "type": "external",
     "startCommand": ["docker", "start", "qdrant"],
     "stopCommand": ["docker", "stop", "qdrant"],
-    "restartCommand": ["docker", "restart", "qdrant"]
+    "restartCommand": ["docker", "restart", "qdrant"],
+    "logCommand": ["docker", "logs", "--tail", "{{tail}}", "qdrant"]
   }
 ]
-
