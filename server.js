@@ -75,15 +75,234 @@ function pageShell(title, body) {
 }
 
 app.get('/admin', (req, res) => {
+  res.redirect(302, '/admin/app');
+});
+
+app.get('/admin/app', (req, res) => {
   res.type('html').send(pageShell('Admin', `
-    <div class="card">
-      <h2 style="margin:0 0 8px 0;">Admin</h2>
-      <div class="row">
-        <a href="/admin/services">Services</a>
-        <a href="/admin/logs">Logs</a>
-        <a href="/hooks/deploy-ai">Deploy hook</a>
+    <div class="row" style="align-items:stretch; gap:12px;">
+      <div class="card" style="width:260px; min-height: calc(100vh - 32px);">
+        <h2 style="margin:0 0 10px 0;">Admin</h2>
+        <div class="muted" style="margin-bottom:10px;">Repo: ${escapeHtml(deploy.repoDir)}</div>
+        <div class="row" style="flex-direction:column; align-items:stretch; gap:8px;">
+          <button class="secondary" onclick="show('services')">Services</button>
+          <button class="secondary" onclick="show('logs')">Logs</button>
+          <button class="secondary" onclick="show('deploy')">Deploy</button>
+          <a class="muted" href="/chat-ui" style="margin-top:10px;">Chat UI</a>
+        </div>
+      </div>
+
+      <div style="flex:1; min-width: 280px;">
+        <div id="view-services" class="view">
+          <div class="card">
+            <div class="row" style="justify-content:space-between;">
+              <div>
+                <h2 style="margin:0 0 6px 0;">Services</h2>
+                <div class="muted">Config file: <span id="servicesConfig">${escapeHtml(services.configPath)}</span></div>
+              </div>
+              <div class="row">
+                <button class="secondary" onclick="reloadServices()">Reload</button>
+                <button class="secondary" onclick="refreshServices()">Refresh</button>
+              </div>
+            </div>
+          </div>
+          <div class="card" id="servicesEmpty" style="display:none;">
+            <div><b>No services configured.</b></div>
+            <div class="muted" style="margin-top:6px;">Create a services.json on the server based on services.example.json.</div>
+          </div>
+          <div class="card" id="servicesTableCard">
+            <table>
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Status</th>
+                  <th>PID</th>
+                  <th>Last</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody id="servicesRows"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div id="view-logs" class="view" style="display:none;">
+          <div class="card">
+            <div class="row" style="justify-content:space-between;">
+              <div>
+                <h2 style="margin:0 0 6px 0;">Logs</h2>
+                <div class="muted">Filter by service and tail length.</div>
+              </div>
+              <div class="row">
+                <button class="secondary" onclick="toggleAuto()" id="autoBtn">Auto: off</button>
+              </div>
+            </div>
+            <div class="row" style="margin-top:10px;">
+              <select id="logService"></select>
+              <input id="logTail" type="number" value="200" min="10" max="5000" />
+              <button class="secondary" onclick="loadLogs()">Load</button>
+            </div>
+            <div class="muted" id="logsEmpty" style="display:none; margin-top:10px;">
+              No services configured. Create services.json first.
+            </div>
+          </div>
+          <div class="card">
+            <pre id="logOut" style="margin:0;"></pre>
+          </div>
+        </div>
+
+        <div id="view-deploy" class="view" style="display:none;">
+          <div class="card">
+            <div class="row" style="justify-content:space-between;">
+              <div>
+                <h2 style="margin:0 0 6px 0;">Deploy</h2>
+                <div class="muted" id="deployHeadline">Loading...</div>
+              </div>
+              <div class="row">
+                <button onclick="pullNow()">Pull now</button>
+                <button class="secondary" onclick="refreshDeploy()">Refresh</button>
+              </div>
+            </div>
+          </div>
+          <div class="card">
+            <div class="muted" style="margin-bottom:8px;">Status</div>
+            <pre id="deployStatus" style="margin:0;"></pre>
+          </div>
+          <div class="card">
+            <div class="muted" style="margin-bottom:8px;">Hook page</div>
+            <div class="row">
+              <a href="/hooks/deploy-ai?view=1">View only</a>
+              <a href="/hooks/deploy-ai">Run pull + view</a>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
+
+    <script>
+      function show(name){
+        document.querySelectorAll('.view').forEach(v => v.style.display = 'none')
+        const el = document.getElementById('view-' + name)
+        if(el) el.style.display = ''
+        if(name === 'services'){ refreshServices() }
+        if(name === 'logs'){ initLogs() }
+        if(name === 'deploy'){ refreshDeploy() }
+      }
+
+      async function api(path, options){
+        const res = await fetch(path, options || {})
+        const data = await res.json().catch(()=>null)
+        if(!res.ok){ throw new Error((data && (data.message || data.error)) || ('HTTP ' + res.status)) }
+        return data
+      }
+
+      function fmt(v){ return v ? String(v) : '' }
+      function pill(text){ return '<span class="pill">'+text+'</span>' }
+
+      function svcRow(s){
+        const status = s.running ? pill('running') : pill('stopped')
+        const pid = s.pid ? String(s.pid) : ''
+        const last = [
+          s.lastStartAt ? ('start: '+s.lastStartAt) : null,
+          s.lastExitAt ? ('exit: '+s.lastExitAt+' code='+(s.lastExitCode ?? '')+' sig='+(s.lastExitSignal ?? '')) : null,
+          s.lastError ? ('err: '+s.lastError) : null
+        ].filter(Boolean).join('\\n')
+        const btn = (label, cls, fn) => '<button class="'+cls+'" onclick="'+fn+'(\\''+s.name.replaceAll(\"'\",\"\\\\'\")+\"\\')\">'+label+'</button>'
+        const actions = [
+          btn('Start','', 'startSvc'),
+          btn('Restart','secondary', 'restartSvc'),
+          btn('Stop','danger', 'stopSvc')
+        ].join(' ')
+        return '<tr>'+
+          '<td><div><b>'+s.name+'</b></div><div class="muted">'+fmt(s.type)+'</div></td>'+
+          '<td>'+status+'</td>'+
+          '<td>'+pid+'</td>'+
+          '<td><pre style="margin:0;">'+fmt(last)+'</pre></td>'+
+          '<td class="row">'+actions+'</td>'+
+        '</tr>'
+      }
+
+      async function refreshServices(){
+        const list = await api('/api/services')
+        const empty = document.getElementById('servicesEmpty')
+        const tableCard = document.getElementById('servicesTableCard')
+        if(!list.length){
+          empty.style.display = ''
+          tableCard.style.display = 'none'
+          document.getElementById('servicesRows').innerHTML = ''
+        } else {
+          empty.style.display = 'none'
+          tableCard.style.display = ''
+          document.getElementById('servicesRows').innerHTML = list.map(svcRow).join('')
+        }
+      }
+
+      async function reloadServices(){
+        await api('/api/services/reload', { method:'POST', headers:{'Content-Type':'application/json'} })
+        await refreshServices()
+      }
+
+      async function startSvc(name){ await api('/api/services/'+encodeURIComponent(name)+'/start', { method:'POST', headers:{'Content-Type':'application/json'} }); await refreshServices() }
+      async function stopSvc(name){ await api('/api/services/'+encodeURIComponent(name)+'/stop', { method:'POST', headers:{'Content-Type':'application/json'} }); await refreshServices() }
+      async function restartSvc(name){ await api('/api/services/'+encodeURIComponent(name)+'/restart', { method:'POST', headers:{'Content-Type':'application/json'} }); await refreshServices() }
+
+      let logTimer = null
+      async function initLogs(){
+        const list = await api('/api/services')
+        const sel = document.getElementById('logService')
+        const empty = document.getElementById('logsEmpty')
+        if(!list.length){
+          sel.innerHTML = ''
+          empty.style.display = ''
+          document.getElementById('logOut').textContent = ''
+          return
+        }
+        empty.style.display = 'none'
+        sel.innerHTML = list.map(s => '<option value="'+s.name+'">'+s.name+'</option>').join('')
+        await loadLogs()
+      }
+
+      async function loadLogs(){
+        const name = document.getElementById('logService').value
+        const tail = document.getElementById('logTail').value || 200
+        if(!name) return
+        const lines = await api('/api/logs?service='+encodeURIComponent(name)+'&tail='+encodeURIComponent(tail))
+        document.getElementById('logOut').textContent = lines.join('\\n')
+      }
+
+      function toggleAuto(){
+        const btn = document.getElementById('autoBtn')
+        if(logTimer){
+          clearInterval(logTimer)
+          logTimer = null
+          btn.textContent = 'Auto: off'
+        } else {
+          logTimer = setInterval(loadLogs, 1500)
+          btn.textContent = 'Auto: on'
+        }
+      }
+
+      function deployHeadlineFrom(status){
+        if(status.lastPullCommit && status.lastPullAtFormatted){
+          return 'Pull triggered: ' + status.lastPullCommit + ' at ' + status.lastPullAtFormatted
+        }
+        return 'Pull not triggered yet'
+      }
+
+      async function refreshDeploy(){
+        const status = await api('/api/deploy/status')
+        document.getElementById('deployHeadline').textContent = deployHeadlineFrom(status)
+        document.getElementById('deployStatus').textContent = JSON.stringify(status, null, 2)
+      }
+
+      async function pullNow(){
+        const status = await api('/api/deploy/pull', { method:'POST', headers:{'Content-Type':'application/json'} })
+        document.getElementById('deployHeadline').textContent = deployHeadlineFrom(status)
+        document.getElementById('deployStatus').textContent = JSON.stringify(status, null, 2)
+      }
+
+      show('services')
+    </script>
   `));
 });
 
@@ -219,6 +438,10 @@ app.get('/api/services', (req, res) => {
   res.json(services.list());
 });
 
+app.post('/api/services/reload', (req, res) => {
+  res.json(services.reload());
+});
+
 app.post('/api/services/:name/start', async (req, res) => {
   try {
     const data = await services.start(req.params.name);
@@ -261,6 +484,10 @@ app.get('/api/logs', async (req, res) => {
 
 app.get('/api/deploy/status', (req, res) => {
   res.json(deploy.getStatus());
+});
+
+app.get('/api/deploy/pull', (req, res) => {
+  res.status(405).json({ error: 'method not allowed', message: 'Use POST /api/deploy/pull' });
 });
 
 app.post('/api/deploy/pull', async (req, res) => {
