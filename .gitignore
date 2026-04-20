@@ -1,2 +1,19 @@
 git add .gitignore
 git commit -m "add gitignore"
+
+# dependencies
+node_modules/
+
+# environment secrets
+.env
+.env.*
+
+# logs
+*.log
+
+# OS junk
+.DS_Store
+
+# optional build outputs
+dist/
+build/

@@ -11,7 +11,8 @@
   "license": "ISC",
   "dependencies": {
     "@qdrant/js-client-rest": "^1.17.0",
-    "axios": "^1.15.0",
+    "aws4": "^1.13.2",
+    "axios": "^1.15.1",
     "cors": "^2.8.6",
     "crypto": "^1.0.1",
     "dotenv": "^17.4.2",
