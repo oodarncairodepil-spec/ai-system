@@ -1,10 +1,14 @@
 require('dotenv').config({ quiet: true });
 const http = require('http');
+const fs = require('fs');
+const path = require('path');
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
 const { QdrantClient } = require('@qdrant/js-client-rest');
 const OpenAI = require('openai');
+const { ServiceManager } = require('./service-manager');
+const { DeployHook } = require('./deploy-hook');
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
 const app = express();
@@ -21,6 +25,7 @@ app.get('/chat-ui', (req, res) => {
 const PORT = Number(process.env.PORT) || 3001;
 const QDRANT_URL = process.env.QDRANT_URL || 'http://localhost:6333';
 const QDRANT_COLLECTION = process.env.QDRANT_COLLECTION || 'products';
+const RUNTIME_DIR = process.env.RUNTIME_DIR || path.join(__dirname, 'runtime');
 
 const qdrant = new QdrantClient({
   url: QDRANT_URL,
@@ -28,6 +33,291 @@ const qdrant = new QdrantClient({
 });
 
 const openai = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
+const services = new ServiceManager({ runtimeDir: RUNTIME_DIR });
+const deploy = new DeployHook({ runtimeDir: RUNTIME_DIR, repoDir: __dirname });
+
+function escapeHtml(str) {
+  return String(str)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+}
+
+function pageShell(title, body) {
+  return `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>${escapeHtml(title)}</title>
+  <style>
+    body{font-family:Arial;background:#0f172a;color:#fff;margin:0;padding:16px}
+    a{color:#60a5fa}
+    .card{background:#111827;border-radius:12px;padding:16px;margin:12px 0}
+    .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+    button{padding:8px 12px;border:0;border-radius:8px;background:#22c55e;color:#fff;cursor:pointer}
+    button.secondary{background:#334155}
+    button.danger{background:#ef4444}
+    select,input{padding:8px 10px;border-radius:8px;border:0;outline:none}
+    pre{white-space:pre-wrap;background:#0b1220;padding:12px;border-radius:10px;overflow:auto;max-height:60vh}
+    table{width:100%;border-collapse:collapse}
+    th,td{padding:8px;border-bottom:1px solid #1f2937;text-align:left;font-size:14px;vertical-align:top}
+    .muted{color:#9ca3af}
+    .pill{display:inline-block;padding:2px 8px;border-radius:999px;background:#1f2937}
+  </style>
+</head>
+<body>
+  ${body}
+</body>
+</html>`;
+}
+
+app.get('/admin', (req, res) => {
+  res.type('html').send(pageShell('Admin', `
+    <div class="card">
+      <h2 style="margin:0 0 8px 0;">Admin</h2>
+      <div class="row">
+        <a href="/admin/services">Services</a>
+        <a href="/admin/logs">Logs</a>
+        <a href="/hooks/deploy-ai">Deploy hook</a>
+      </div>
+    </div>
+  `));
+});
+
+app.get('/admin/services', (req, res) => {
+  res.type('html').send(pageShell('Services', `
+    <div class="card">
+      <div class="row" style="justify-content:space-between;">
+        <div>
+          <h2 style="margin:0 0 6px 0;">Services</h2>
+          <div class="muted">Config file: ${escapeHtml(services.configPath)}</div>
+        </div>
+        <div class="row">
+          <button class="secondary" onclick="refresh()">Refresh</button>
+          <a class="muted" href="/admin">Back</a>
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <table>
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Status</th>
+            <th>PID</th>
+            <th>Last</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+    <script>
+      function fmt(v){return v ? String(v) : ''}
+      function pill(text){return '<span class="pill">'+text+'</span>'}
+      async function api(path, method){
+        const res = await fetch(path, {method, headers:{'Content-Type':'application/json'}});
+        const data = await res.json().catch(()=>null);
+        if(!res.ok){throw new Error((data && (data.message||data.error)) || ('HTTP '+res.status))}
+        return data
+      }
+      function row(s){
+        const status = s.running ? pill('running') : pill('stopped')
+        const pid = s.pid ? String(s.pid) : ''
+        const last = [
+          s.lastStartAt ? ('start: '+s.lastStartAt) : null,
+          s.lastExitAt ? ('exit: '+s.lastExitAt+' code='+(s.lastExitCode ?? '')+' sig='+(s.lastExitSignal ?? '')) : null,
+          s.lastError ? ('err: '+s.lastError) : null
+        ].filter(Boolean).join('\\n')
+        const btn = (label, cls, fn) => '<button class="'+cls+'" onclick="'+fn+'(\\''+s.name.replaceAll(\"'\",\"\\\\'\")+\"\\')\">'+label+'</button>'
+        const actions = [
+          btn('Start','', 'startSvc'),
+          btn('Restart','secondary', 'restartSvc'),
+          btn('Stop','danger', 'stopSvc')
+        ].join(' ')
+        return '<tr>'+
+          '<td><div><b>'+s.name+'</b></div><div class="muted">'+fmt(s.type)+'</div></td>'+
+          '<td>'+status+'</td>'+
+          '<td>'+pid+'</td>'+
+          '<td><pre style="margin:0;">'+fmt(last)+'</pre></td>'+
+          '<td class="row">'+actions+'</td>'+
+        '</tr>'
+      }
+      async function refresh(){
+        const list = await api('/api/services','GET')
+        document.getElementById('rows').innerHTML = list.map(row).join('')
+      }
+      async function startSvc(name){ await api('/api/services/'+encodeURIComponent(name)+'/start','POST'); await refresh() }
+      async function stopSvc(name){ await api('/api/services/'+encodeURIComponent(name)+'/stop','POST'); await refresh() }
+      async function restartSvc(name){ await api('/api/services/'+encodeURIComponent(name)+'/restart','POST'); await refresh() }
+      refresh()
+    </script>
+  `));
+});
+
+app.get('/admin/logs', (req, res) => {
+  res.type('html').send(pageShell('Logs', `
+    <div class="card">
+      <div class="row" style="justify-content:space-between;">
+        <div>
+          <h2 style="margin:0 0 6px 0;">Logs</h2>
+          <div class="muted">Filter by service and tail length.</div>
+        </div>
+        <div class="row">
+          <a class="muted" href="/admin">Back</a>
+        </div>
+      </div>
+      <div class="row" style="margin-top:8px;">
+        <select id="service"></select>
+        <input id="tail" type="number" value="200" min="10" max="5000" />
+        <button class="secondary" onclick="load()">Load</button>
+        <button class="secondary" onclick="toggleAuto()" id="autoBtn">Auto: off</button>
+      </div>
+    </div>
+    <div class="card">
+      <pre id="out" style="margin:0;"></pre>
+    </div>
+    <script>
+      let timer = null
+      async function api(path){
+        const res = await fetch(path)
+        const data = await res.json().catch(()=>null)
+        if(!res.ok){throw new Error((data && (data.message||data.error)) || ('HTTP '+res.status))}
+        return data
+      }
+      async function init(){
+        const list = await api('/api/services')
+        const sel = document.getElementById('service')
+        sel.innerHTML = list.map(s => '<option value="'+s.name+'">'+s.name+'</option>').join('')
+        if(list.length){ await load() }
+      }
+      async function load(){
+        const name = document.getElementById('service').value
+        const tail = document.getElementById('tail').value || 200
+        const lines = await api('/api/logs?service='+encodeURIComponent(name)+'&tail='+encodeURIComponent(tail))
+        document.getElementById('out').textContent = lines.join('\\n')
+      }
+      function toggleAuto(){
+        if(timer){
+          clearInterval(timer)
+          timer = null
+          document.getElementById('autoBtn').textContent = 'Auto: off'
+        } else {
+          timer = setInterval(load, 1500)
+          document.getElementById('autoBtn').textContent = 'Auto: on'
+        }
+      }
+      init()
+    </script>
+  `));
+});
+
+app.get('/api/services', (req, res) => {
+  res.json(services.list());
+});
+
+app.post('/api/services/:name/start', async (req, res) => {
+  try {
+    const data = await services.start(req.params.name);
+    res.json(data);
+  } catch (err) {
+    res.status(400).json({ error: 'start failed', message: String(err?.message || err) });
+  }
+});
+
+app.post('/api/services/:name/stop', async (req, res) => {
+  try {
+    const data = await services.stop(req.params.name);
+    res.json(data);
+  } catch (err) {
+    res.status(400).json({ error: 'stop failed', message: String(err?.message || err) });
+  }
+});
+
+app.post('/api/services/:name/restart', async (req, res) => {
+  try {
+    const data = await services.restart(req.params.name);
+    res.json(data);
+  } catch (err) {
+    res.status(400).json({ error: 'restart failed', message: String(err?.message || err) });
+  }
+});
+
+app.get('/api/logs', (req, res) => {
+  const name = String(req.query.service || '');
+  if (!name) {
+    res.status(400).json({ error: 'missing service' });
+    return;
+  }
+  res.json(services.getLogs(name, req.query.tail));
+});
+
+app.get('/api/deploy/status', (req, res) => {
+  res.json(deploy.getStatus());
+});
+
+app.post('/api/deploy/pull', async (req, res) => {
+  try {
+    const status = await deploy.pull();
+    res.json(status);
+  } catch (err) {
+    res.status(500).json({ error: 'pull failed', message: String(err?.message || err) });
+  }
+});
+
+app.all('/hooks/deploy-ai', async (req, res) => {
+  const viewOnly = String(req.query.view || '') === '1';
+  const shouldPull = !viewOnly && (req.method === 'POST' || req.method === 'GET');
+  if (shouldPull) {
+    try {
+      await deploy.pull();
+    } catch (err) {
+    }
+  }
+  const status = deploy.getStatus();
+  const headline = status.lastPullCommit && status.lastPullAtFormatted
+    ? `Pull triggered: ${escapeHtml(status.lastPullCommit)} at ${escapeHtml(status.lastPullAtFormatted)}`
+    : 'Pull not triggered yet';
+  const detail = [
+    status.lastPullOk === null ? null : `ok=${status.lastPullOk}`,
+    status.lastPullOutput ? `stdout=${status.lastPullOutput}` : null,
+    status.lastPullError ? `stderr=${status.lastPullError}` : null,
+  ].filter(Boolean).join('\n');
+
+  res.type('html').send(pageShell('Deploy hook', `
+    <div class="card">
+      <div class="row" style="justify-content:space-between;">
+        <div>
+          <h2 style="margin:0 0 6px 0;">Deploy hook</h2>
+          <div class="muted">${escapeHtml(headline)}</div>
+        </div>
+        <div class="row">
+          <a class="muted" href="/admin">Back</a>
+        </div>
+      </div>
+      <div class="row" style="margin-top:10px;">
+        <button onclick="pullNow()">Pull now</button>
+        <button class="secondary" onclick="refresh()">Refresh</button>
+      </div>
+    </div>
+    <div class="card">
+      <div class="muted" style="margin-bottom:8px;">Details</div>
+      <pre style="margin:0;" id="detail">${escapeHtml(detail || '')}</pre>
+    </div>
+    <script>
+      async function pullNow(){
+        const res = await fetch('/api/deploy/pull', { method:'POST', headers:{'Content-Type':'application/json'} })
+        const data = await res.json().catch(()=>null)
+        if(!res.ok){ alert((data && (data.message||data.error)) || ('HTTP '+res.status)); return }
+        location.reload()
+      }
+      async function refresh(){ location.reload() }
+    </script>
+  `));
+});
 
 // ==============================
 // EMBEDDING (LOCAL - OLLAMA)

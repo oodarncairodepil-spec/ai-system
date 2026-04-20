@@ -1,0 +1,16 @@
+[
+  {
+    "name": "ollama",
+    "type": "command",
+    "command": "ollama",
+    "args": ["serve"]
+  },
+  {
+    "name": "qdrant-docker",
+    "type": "external",
+    "startCommand": ["docker", "start", "qdrant"],
+    "stopCommand": ["docker", "stop", "qdrant"],
+    "restartCommand": ["docker", "restart", "qdrant"]
+  }
+]
+
